@@ -1,0 +1,181 @@
+---
+title: "Line Plots"
+author: "Erik Petersen"
+date: "2026-11-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+# 1. Define paths based on your Analyzing_Unemployment folder on the Desktop
+DATA_DIR     <- "~/Desktop/Analyzing_Unemployment"
+PARQUET_PATH <- file.path(DATA_DIR, "cps_master_panel_2005_2026.parquet")
+HAZARD_CSV   <- file.path(DATA_DIR, "cps_monthly_hazards.csv")
+
+# 2. Load Parquet Data (efficient column selection to prevent crashes)
+cols_to_load <- c("YEAR", "MONTH", "CPSIDP", "EMPSTAT", "IND", "WTFINL", "MISH")
+
+df <- read_parquet(PARQUET_PATH, col_select = all_of(cols_to_load)) %>%
+  filter(EMPSTAT %in% c(10, 11, 12, 20, 21))
+
+print(paste("Successfully loaded rows:", nrow(df)))
+```
+
+```{r}
+# 2. Data Cleaning & Longitudinal Linking for Transition Rates
+df <- df %>%
+  mutate(
+    Date = make_date(year = YEAR, month = MONTH, day = 1),
+    Employed = ifelse(EMPSTAT %in% c(10, 11, 12), 1, 0),
+    Unemployed = ifelse(EMPSTAT %in% c(20, 21), 1, 0)
+  )
+
+# Group major industries based on CPS industry codes
+df <- df %>%
+  mutate(Industry_Group = case_when(
+    IND >= 170 & IND <= 290  ~ "Agriculture & Mining",
+    IND >= 370 & IND <= 499  ~ "Construction",
+    IND >= 1070 & IND <= 3990 ~ "Manufacturing",
+    IND >= 4070 & IND <= 4590 ~ "Trade, Transportation & Utilities",
+    IND >= 5070 & IND <= 5790 ~ "Information & Financial Activities",
+    IND >= 6070 & IND <= 6390 ~ "Professional & Business Services",
+    IND >= 6470 & IND <= 7690 ~ "Education & Health Services",
+    IND >= 7770 & IND <= 8470 ~ "Leisure & Hospitality",
+    TRUE ~ "Other Services"
+  ))
+
+# Sort by person identifier and time to track consecutive months
+df <- df %>% arrange(CPSIDP, YEAR, MONTH)
+
+# Calculate month-over-month transitions using lag within each individual (CPSIDP)
+df_transitions <- df %>%
+  group_by(CPSIDP) %>%
+  mutate(
+    Prev_Employed = lag(Employed),
+    Prev_Unemployed = lag(Unemployed),
+    Prev_Date = lag(Date),
+    Prev_Ind = lag(Industry_Group)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(Prev_Employed) & Date == (Prev_Date + months(1)))
+
+# Calculate monthly Separation Rate and Job Finding Rate by Industry
+transition_rates <- df_transitions %>%
+  filter(Industry_Group == Prev_Ind) %>% 
+  group_by(Date, Industry_Group) %>%
+  summarize(
+    At_Risk_E = sum(Prev_Employed == 1, na.rm = TRUE),
+    Separations = sum(Prev_Employed == 1 & Unemployed == 1, na.rm = TRUE),
+    Separation_Rate = Separations / At_Risk_E,
+    
+    At_Risk_U = sum(Prev_Unemployed == 1, na.rm = TRUE),
+    Findings = sum(Prev_Unemployed == 1 & Employed == 1, na.rm = TRUE),
+    Finding_Rate = Findings / At_Risk_U,
+    .groups = "drop"
+  )
+
+# Define Recession Shading Rectangles & Plot Theme
+recessions <- data.frame(
+  start = as.Date(c("2007-12-01", "2020-02-01")),
+  end = as.Date(c("2009-06-01", "2020-04-01")),
+  Event = c("Great Recession", "COVID Pandemic")
+)
+
+theme_dsdc <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+# --- Plot 1: Overall Monthly Separation Rate Across Time ---
+overall_sep <- transition_rates %>%
+  group_by(Date) %>%
+  summarize(Separation_Rate = sum(Separations) / sum(At_Risk_E))
+
+p1 <- ggplot(overall_sep, aes(x = Date, y = Separation_Rate)) +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = Event),
+            inherit.aes = FALSE, alpha = 0.2) +
+  scale_fill_manual(values = c("Great Recession" = "firebrick", "COVID Pandemic" = "steelblue")) +
+  geom_line(color = "#1a73e8", linewidth = 0.8) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Aggregate Job Separation Rate (2005–2026)",
+    subtitle = "Monthly probability of transitioning from Employed to Unemployed",
+    x = "Year", y = "Separation Rate", fill = "Recession"
+  ) +
+  theme_dsdc
+print(p1)
+```
+
+```{r}
+# --- Plot 2: Overall Monthly Job Finding Rate Across Time ---
+overall_find <- transition_rates %>%
+  group_by(Date) %>%
+  summarize(Finding_Rate = sum(Findings) / sum(At_Risk_U))
+
+p2 <- ggplot(overall_find, aes(x = Date, y = Finding_Rate)) +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = Event),
+            inherit.aes = FALSE, alpha = 0.2) +
+  scale_fill_manual(values = c("Great Recession" = "firebrick", "COVID Pandemic" = "steelblue")) +
+  geom_line(color = "#34a853", linewidth = 0.8) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Aggregate Job Finding Rate (2005–2026)",
+    subtitle = "Monthly probability of transitioning from Unemployed to Employed",
+    x = "Year", y = "Finding Rate", fill = "Recession"
+  ) +
+  theme_dsdc
+print(p2)
+```
+
+```{r}
+# --- Plot 3: Industry-Specific Separation Rates (Faceted Line Plot) ---
+p3 <- ggplot(transition_rates, aes(x = Date, y = Separation_Rate, color = Industry_Group)) +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = Event),
+            inherit.aes = FALSE, alpha = 0.15) +
+  scale_fill_manual(values = c("Great Recession" = "firebrick", "COVID Pandemic" = "steelblue")) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ Industry_Group, scales = "free_y", ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Job Separation Rates by Industry Sector",
+    subtitle = "Comparing volatility during the Great Recession and COVID-19",
+    x = "Year", y = "Separation Rate", fill = "Recession"
+  ) +
+  theme_dsdc +
+  theme(legend.position = "none")
+print(p3)
+```
+
+```{r}
+# --- Plot 4: Industry-Specific Job Finding Rates (Faceted Line Plot) ---
+p4 <- ggplot(transition_rates, aes(x = Date, y = Finding_Rate, color = Industry_Group)) +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = Event),
+            inherit.aes = FALSE, alpha = 0.15) +
+  scale_fill_manual(values = c("Great Recession" = "firebrick", "COVID Pandemic" = "steelblue")) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ Industry_Group, scales = "free_y", ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Job Finding Rates by Industry Sector",
+    subtitle = "Speed of labor market re-entry across industries",
+    x = "Year", y = "Finding Rate", fill = "Recession"
+  ) +
+  theme_dsdc +
+  theme(legend.position = "none")
+print(p4)
+```
