@@ -1,0 +1,216 @@
+```{r}
+## DDSC Project Fall 2026
+
+library(tidyverse)   # includes dplyr, ggplot2, readr, lubridate
+library(arrow)
+
+# ------------------------------------------------------------------------------
+# SETUP
+# ------------------------------------------------------------------------------
+data_dir <- "/Users/jared/Desktop/Analyzing Unemployment/"   
+out_dir  <- file.path(data_dir, "eda_output")
+dir.create(out_dir, showWarnings = FALSE)
+
+panel   <- read_parquet(file.path(data_dir, "cps_master_panel_2005_2026.parquet"))
+hazards <- read_csv(file.path(data_dir, "cps_monthly_hazards.csv"))
+
+# Recession shading used in the line plots
+recessions <- tibble(
+  start = as.Date(c("2007-12-01", "2020-02-01")),
+  end   = as.Date(c("2009-06-01", "2020-04-01"))
+)
+shade <- geom_rect(
+  data = recessions, inherit.aes = FALSE,
+  aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+  fill = "grey70", alpha = 0.35
+)
+
+# ------------------------------------------------------------------------------
+# HELPER: weighted summary statistics
+# ------------------------------------------------------------------------------
+wtd_quantile <- function(x, w, probs) {
+  ok <- !is.na(x) & !is.na(w)
+  x <- x[ok]; w <- w[ok]
+  o <- order(x); x <- x[o]; w <- w[o]
+  cw <- cumsum(w) / sum(w)
+  sapply(probs, function(p) x[which(cw >= p)[1]])
+}
+
+wtd_summary <- function(x, w = rep(1, length(x))) {
+  ok <- !is.na(x) & !is.na(w)
+  xv <- x[ok]; wv <- w[ok]
+  m  <- sum(wv * xv) / sum(wv)
+  q  <- wtd_quantile(xv, wv, c(0.25, 0.5, 0.75))
+  tibble(
+    N      = length(xv),
+    Mean   = m,
+    SD     = sqrt(sum(wv * (xv - m)^2) / sum(wv)),
+    Min    = min(xv),
+    P25    = q[1],
+    Median = q[2],
+    P75    = q[3],
+    Max    = max(xv)
+  )
+}
+
+# ==============================================================================
+# FILE 1: MASTER PANEL
+# ==============================================================================
+
+# Prep: clean IPUMS NIU/missing codes and build indicators
+panel <- panel %>%
+  mutate(
+    date      = make_date(YEAR, MONTH, 1),
+    DURUNEMP  = if_else(lfs == "U" & DURUNEMP < 999, DURUNEMP, NA_real_),       # weeks, unemployed only
+    UHRSWORK1 = if_else(lfs == "E" & UHRSWORK1 < 997, UHRSWORK1, NA_real_),     # hours, employed only
+    female    = as.numeric(SEX == 2),
+    is_E      = as.numeric(lfs == "E"),
+    is_U      = as.numeric(lfs == "U"),
+    is_N      = as.numeric(lfs == "N"),
+    EU_flow   = as.numeric(lfs == "E" & next_lfs == "U"),
+    UE_flow   = as.numeric(lfs == "U" & next_lfs == "E")
+  )
+
+# ---- Summary statistics table (weighted by WTFINL) ----
+# Note: EU_flow / UE_flow are computed over everyone, so their means are
+# unconditional shares; the conditional rates (s_raw, f_raw) are in File 2.
+vars1 <- c(
+  "AGE", "female", "is_E", "is_U", "is_N",
+  "DURUNEMP", "UHRSWORK1", "EU_flow", "UE_flow"
+)
+
+labels1 <- c(
+  AGE = "Age (years)",
+  female = "Female (share)",
+  is_E = "Employed (share)",
+  is_U = "Unemployed (share)",
+  is_N = "Not in labor force (share)",
+  DURUNEMP = "Unemployment duration (weeks; unemployed only)",
+  UHRSWORK1 = "Usual weekly hours (employed only)",
+  EU_flow = "E -> U transition (share of all)",
+  UE_flow = "U -> E transition (share of all)"
+)
+
+summary1 <- map_dfr(vars1, function(v) {
+  wtd_summary(panel[[v]], panel$WTFINL) %>% mutate(Variable = labels1[[v]], .before = 1)
+}) %>%
+  mutate(across(where(is.numeric) & !N, ~ round(.x, 3)))
+
+print(summary1, n = Inf, width = Inf)
+write_csv(summary1, file.path(out_dir, "summary_table_master_panel.csv"))
+
+# ---- Plot 1a: Histogram of unemployment duration (weighted) ----
+p1a <- panel %>%
+  filter(!is.na(DURUNEMP), DURUNEMP <= 104) %>%     # cap at 2 years for readability
+  ggplot(aes(x = DURUNEMP, weight = WTFINL)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Unemployment Duration",
+       subtitle = "Prime-age unemployed, weighted by WTFINL (capped at 104 weeks)",
+       x = "Continuous weeks unemployed", y = "Weighted count") +
+  theme_minimal()
+
+# ---- Plot 1b: Boxplot of age by labor force state ----
+# Unweighted, drawn from a random sample of rows for speed
+set.seed(42)
+p1b <- panel %>%
+  slice_sample(n = min(500000, nrow(panel))) %>%
+  mutate(lfs = factor(lfs, levels = c("E", "U", "N"),
+                      labels = c("Employed", "Unemployed", "Not in LF"))) %>%
+  ggplot(aes(x = lfs, y = AGE, fill = lfs)) +
+  geom_boxplot(outlier.alpha = 0.1, show.legend = FALSE) +
+  labs(title = "Age by Labor Force State",
+       subtitle = "Unweighted; random sample of 500k matched observations",
+       x = NULL, y = "Age") +
+  theme_minimal()
+
+# ---- Plot 1c: Line plot of labor force state shares over time ----
+p1c <- panel %>%
+  group_by(date) %>%
+  summarize(
+    Employed       = sum(WTFINL[lfs == "E"]) / sum(WTFINL),
+    Unemployed     = sum(WTFINL[lfs == "U"]) / sum(WTFINL),
+    `Not in LF`    = sum(WTFINL[lfs == "N"]) / sum(WTFINL),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-date, names_to = "State", values_to = "Share") %>%
+  ggplot(aes(x = date, y = Share, color = State)) +
+  shade +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~State, ncol = 1, scales = "free_y") +
+  labs(title = "Labor Force State Shares Over Time",
+       subtitle = "Matched prime-age sample, weighted; shaded = recessions",
+       x = NULL, y = "Share of sample") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave(file.path(out_dir, "panel_hist_durunemp.png"),   p1a, width = 8, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "panel_box_age_by_state.png"), p1b, width = 6, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "panel_line_state_shares.png"), p1c, width = 8, height = 7, dpi = 300)
+
+# ==============================================================================
+# FILE 2: MONTHLY HAZARDS TIME SERIES
+# ==============================================================================
+
+hazards <- hazards %>%
+  mutate(date = make_date(YEAR, MONTH, 1))
+
+# ---- Summary statistics table (unweighted; each row is one month) ----
+vars2 <- c("E_t", "U_t", "EU", "UE", "U_short",
+           "f_raw", "s_raw", "f_shimer", "lambda_t", "s_t")
+
+summary2 <- map_dfr(vars2, function(v) {
+  x <- hazards[[v]]
+  x[!is.finite(x)] <- NA        # drops Inf/NaN from log() issues
+  wtd_summary(x) %>% mutate(Variable = v, .before = 1)
+}) %>%
+  mutate(across(where(is.numeric) & !N, ~ round(.x, 4)))
+
+print(summary2, n = Inf, width = Inf)
+write_csv(summary2, file.path(out_dir, "summary_table_monthly_hazards.csv"))
+
+# ---- Plot 2a: Line plot of raw job-finding and separation rates ----
+p2a <- hazards %>%
+  select(date, `Job-finding rate (f_raw)` = f_raw, `Separation rate (s_raw)` = s_raw) %>%
+  pivot_longer(-date, names_to = "Rate", values_to = "Value") %>%
+  ggplot(aes(x = date, y = Value, color = Rate)) +
+  shade +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~Rate, ncol = 1, scales = "free_y") +
+  labs(title = "Monthly Job-Finding and Separation Rates",
+       subtitle = "Gross-flow measures, prime-age workers; shaded = recessions",
+       x = NULL, y = "Monthly probability") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# ---- Plot 2b: Histograms of the continuous-time hazards ----
+p2b <- hazards %>%
+  select(`Job-finding hazard (lambda_t)` = lambda_t, `Separation hazard (s_t)` = s_t) %>%
+  pivot_longer(everything(), names_to = "Hazard", values_to = "Value") %>%
+  filter(is.finite(Value)) %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~Hazard, scales = "free") +
+  labs(title = "Distribution of Continuous-Time Hazard Rates",
+       x = "Hazard rate", y = "Number of months") +
+  theme_minimal()
+
+# ---- Plot 2c: Boxplots of rates by calendar month (seasonality) ----
+p2c <- hazards %>%
+  select(MONTH, `Job-finding rate (f_raw)` = f_raw, `Separation rate (s_raw)` = s_raw) %>%
+  pivot_longer(-MONTH, names_to = "Rate", values_to = "Value") %>%
+  mutate(Month = factor(MONTH, levels = 1:12, labels = month.abb)) %>%
+  ggplot(aes(x = Month, y = Value)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.alpha = 0.6) +
+  facet_wrap(~Rate, ncol = 1, scales = "free_y") +
+  labs(title = "Seasonality in Monthly Transition Rates",
+       subtitle = "Each box is the distribution across years for that calendar month",
+       x = NULL, y = "Monthly probability") +
+  theme_minimal()
+
+ggsave(file.path(out_dir, "hazards_line_rates.png"),  p2a, width = 8, height = 6, dpi = 300)
+ggsave(file.path(out_dir, "hazards_hist_hazards.png"), p2b, width = 9, height = 4.5, dpi = 300)
+ggsave(file.path(out_dir, "hazards_box_seasonality.png"), p2c, width = 8, height = 6, dpi = 300)
+
+cat("All tables and plots saved to:", out_dir, "\n")
+```
+
